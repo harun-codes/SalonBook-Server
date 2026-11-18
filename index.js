@@ -404,6 +404,76 @@ app.get("/appointments/my", verifyCustomer, async (req, res) => {
 
 
 
+app.patch("/appointments/:id/cancel", verifyCustomer, async (req, res) => {
+  try {
+    const { id } = req.params;
+
+    if (!ObjectId.isValid(id)) {
+      return res.status(400).json({
+        success: false,
+        message: "Invalid appointment ID",
+      });
+    }
+
+    const appointmentId = new ObjectId(id);
+
+    const filter = {
+      _id: appointmentId,
+      customerId: req.authUser.id,
+      status: "pending",
+    };
+
+    const result = await appointments.updateOne(
+      filter,
+      {
+        $set: {
+          status: "cancelled",
+          cancelledAt: new Date(),
+          updatedAt: new Date(),
+        },
+      }
+    );
+
+    if (result.matchedCount === 0) {
+      const existingAppointment = await appointments.findOne({
+        _id: appointmentId,
+        customerId: req.authUser.id,
+      });
+
+      if (!existingAppointment) {
+        return res.status(404).json({
+          success: false,
+          message: "Appointment not found",
+        });
+      }
+
+      return res.status(409).json({
+        success: false,
+        message: "Only pending appointments can be cancelled",
+      });
+    }
+
+    const updatedAppointment = await appointments.findOne({
+      _id: appointmentId,
+      customerId: req.authUser.id,
+    });
+
+    return res.status(200).json({
+      success: true,
+      message: "Appointment cancelled successfully",
+      appointment: updatedAppointment,
+    });
+  } catch (error) {
+    console.error("Cancel appointment error:", error);
+
+    return res.status(500).json({
+      success: false,
+      message: "Failed to cancel appointment",
+    });
+  }
+});
+
+
 
 app.listen(port, () => {
   console.log(`Server is running on port ${port}`);
