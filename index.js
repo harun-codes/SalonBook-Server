@@ -352,6 +352,58 @@ app.post("/appointments", verifyCustomer, async (req, res) => {
 
 
 
+app.get("/appointments/my", verifyCustomer, async (req, res) => {
+  try {
+    const customerAppointments = await appointments
+      .find({
+        customerId: req.authUser.id,
+      })
+      .sort({ createdAt: -1 })
+      .toArray();
+
+    const serviceIds = [
+      ...new Set(
+        customerAppointments
+          .map((appointment) => appointment.serviceId)
+          .filter((id) => ObjectId.isValid(id))
+      ),
+    ].map((id) => new ObjectId(id));
+
+    const services = serviceIds.length
+      ? await salonbook
+          .find({ _id: { $in: serviceIds } })
+          .toArray()
+      : [];
+
+    const serviceMap = new Map(
+      services.map((service) => [
+        service._id.toString(),
+        service,
+      ])
+    );
+
+    const result = customerAppointments.map((appointment) => ({
+      ...appointment,
+      service: serviceMap.get(appointment.serviceId) || null,
+    }));
+
+    return res.status(200).json({
+      success: true,
+      count: result.length,
+      appointments: result,
+    });
+  } catch (error) {
+    console.error("Fetch appointments error:", error);
+
+    return res.status(500).json({
+      success: false,
+      message: "Failed to fetch appointments",
+    });
+  }
+});
+
+
+
 
 app.listen(port, () => {
   console.log(`Server is running on port ${port}`);
