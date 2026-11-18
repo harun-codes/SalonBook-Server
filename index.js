@@ -30,7 +30,7 @@ app.get('/', async(req, res) => {
     res.send('Salon Book Server is Running Succesfully')
 })
 
-
+// services related Api
 
 app.get("/services", async (req, res) => {
   try {
@@ -46,6 +46,29 @@ app.get("/services", async (req, res) => {
       success: false,
       message: "Failed to fetch services",
     });
+  }
+});
+
+
+app.get('/services/:id', async (req, res) => {
+  try {
+    const { id } = req.params;
+
+    if (!ObjectId.isValid(id)) {
+      return res.status(400).send({ message: 'Invalid service ID' });
+    }
+
+    const result = await db.collection('salonbook').findOne({
+      _id: new ObjectId(id)
+    });
+
+    if (!result) {
+      return res.status(404).send({ message: 'Service not found' });
+    }
+
+    res.status(200).send(result);
+  } catch (error) {
+    res.status(500).send({ message: 'Failed to fetch service' });
   }
 });
 
