@@ -209,6 +209,132 @@ app.get("/users/me", verifyCustomer, async (req, res) => {
 
 
 
+app.patch("/users/me", verifyCustomer, async (req, res) => {
+  try {
+    const { name, phone, image } = req.body;
+
+    const updates = {};
+
+    if (name !== undefined) {
+      if (
+        typeof name !== "string" ||
+        name.trim().length < 2 ||
+        name.trim().length > 60
+      ) {
+        return res.status(400).json({
+          success: false,
+          message: "Name must contain 2-60 characters",
+        });
+      }
+
+      updates.name = name.trim();
+    }
+
+    if (phone !== undefined) {
+      if (typeof phone !== "string" || phone.length > 25) {
+        return res.status(400).json({
+          success: false,
+          message: "Invalid phone number",
+        });
+      }
+
+      const cleanPhone = phone.trim();
+
+      if (
+        cleanPhone &&
+        !/^[+()\d\s-]{7,20}$/.test(cleanPhone)
+      ) {
+        return res.status(400).json({
+          success: false,
+          message: "Please provide a valid phone number",
+        });
+      }
+
+      updates.phone = cleanPhone;
+    }
+
+    if (image !== undefined) {
+      if (typeof image !== "string" || image.length > 2048) {
+        return res.status(400).json({
+          success: false,
+          message: "Invalid profile image",
+        });
+      }
+
+      if (image !== "") {
+        try {
+          const imageUrl = new URL(image);
+
+          if (
+            imageUrl.protocol !== "https:" ||
+            !["i.ibb.co", "ibb.co"].includes(imageUrl.hostname)
+          ) {
+            return res.status(400).json({
+              success: false,
+              message: "Invalid profile image URL",
+            });
+          }
+        } catch {
+          return res.status(400).json({
+            success: false,
+            message: "Invalid profile image URL",
+          });
+        }
+      }
+
+      updates.image = image;
+    }
+
+    if (Object.keys(updates).length === 0) {
+      return res.status(400).json({
+        success: false,
+        message: "No profile information provided",
+      });
+    }
+
+    const userFilter = req.authUser.mongoId !== undefined
+      ? { _id: req.authUser.mongoId }
+      : { id: req.authUser.id };
+
+    const result = await users.updateOne(
+      userFilter,
+      {
+        $set: {
+          ...updates,
+          updatedAt: new Date(),
+        },
+      }
+    );
+
+    if (result.matchedCount === 0) {
+      return res.status(404).json({
+        success: false,
+        message: "User not found",
+      });
+    }
+
+    return res.status(200).json({
+      success: true,
+      message: "Profile updated successfully",
+      user: {
+        id: req.authUser.id,
+        name: updates.name ?? req.authUser.name,
+        email: req.authUser.email,
+        phone: updates.phone ?? req.authUser.phone,
+        image: updates.image ?? req.authUser.image,
+      },
+    });
+  } catch (error) {
+    console.error("Update profile error:", error);
+
+    return res.status(500).json({
+      success: false,
+      message: "Failed to update profile",
+    });
+  }
+});
+
+
 
 // services related Api
 
