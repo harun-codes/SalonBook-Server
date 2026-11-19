@@ -740,6 +740,191 @@ app.post("/admin/services", verifyAdmin, async (req, res) => {
 
 
 
+app.patch("/admin/services/:id", verifyAdmin, async (req, res) => {
+    try {
+        const { id } = req.params;
+
+        if (!ObjectId.isValid(id)) {
+            return res.status(400).json({
+                success: false,
+                message: "Invalid service ID",
+            });
+        }
+
+        const body = req.body;
+
+        if (!body || typeof body !== "object" || Array.isArray(body)) {
+            return res.status(400).json({
+                success: false,
+                message: "Invalid request body",
+            });
+        }
+
+        const updates = {};
+
+        if (Object.prototype.hasOwnProperty.call(body, "serviceName")) {
+            if (
+                typeof body.serviceName !== "string" ||
+                body.serviceName.trim().length < 2 ||
+                body.serviceName.trim().length > 100
+            ) {
+                return res.status(400).json({
+                    success: false,
+                    message: "Invalid service name",
+                });
+            }
+
+            updates.serviceName = body.serviceName.trim();
+        }
+
+        if (Object.prototype.hasOwnProperty.call(body, "category")) {
+            if (
+                typeof body.category !== "string" ||
+                body.category.trim().length < 2 ||
+                body.category.trim().length > 60
+            ) {
+                return res.status(400).json({
+                    success: false,
+                    message: "Invalid service category",
+                });
+            }
+
+            updates.category = body.category.trim();
+        }
+
+        if (Object.prototype.hasOwnProperty.call(body, "description")) {
+            if (
+                typeof body.description !== "string" ||
+                !body.description.trim() ||
+                body.description.trim().length > 2000
+            ) {
+                return res.status(400).json({
+                    success: false,
+                    message: "Invalid service description",
+                });
+            }
+
+            updates.description = body.description.trim();
+        }
+
+        if (Object.prototype.hasOwnProperty.call(body, "price")) {
+            const price = Number(body.price);
+
+            if (!Number.isFinite(price) || price <= 0) {
+                return res.status(400).json({
+                    success: false,
+                    message: "Invalid service price",
+                });
+            }
+
+            updates.price = price;
+        }
+
+        if (Object.prototype.hasOwnProperty.call(body, "duration")) {
+            const duration = Number(body.duration);
+
+            if (!Number.isInteger(duration) || duration <= 0) {
+                return res.status(400).json({
+                    success: false,
+                    message: "Invalid service duration",
+                });
+            }
+
+            updates.duration = duration;
+        }
+
+        if (Object.prototype.hasOwnProperty.call(body, "image")) {
+            if (
+                typeof body.image !== "string" ||
+                body.image.trim().length > 2048
+            ) {
+                return res.status(400).json({
+                    success: false,
+                    message: "Invalid service image",
+                });
+            }
+
+            const image = body.image.trim();
+
+            if (image) {
+                try {
+                    const imageUrl = new URL(image);
+
+                    if (imageUrl.protocol !== "https:") {
+                        return res.status(400).json({
+                            success: false,
+                            message: "Service image must use HTTPS",
+                        });
+                    }
+                } catch {
+                    return res.status(400).json({
+                        success: false,
+                        message: "Invalid service image URL",
+                    });
+                }
+            }
+
+            updates.image = image;
+        }
+
+        if (Object.prototype.hasOwnProperty.call(body, "status")) {
+            if (
+                typeof body.status !== "string" ||
+                !["active", "inactive"].includes(body.status.toLowerCase())
+            ) {
+                return res.status(400).json({
+                    success: false,
+                    message: "Invalid service status",
+                });
+            }
+
+            updates.status = body.status.toLowerCase();
+        }
+
+        if (Object.keys(updates).length === 0) {
+            return res.status(400).json({
+                success: false,
+                message: "No valid service information provided",
+            });
+        }
+
+        updates.updatedAt = new Date();
+
+        const serviceId = new ObjectId(id);
+
+        const result = await salonbook.updateOne(
+            { _id: serviceId },
+            { $set: updates }
+        );
+
+        if (result.matchedCount === 0) {
+            return res.status(404).json({
+                success: false,
+                message: "Service not found",
+            });
+        }
+
+        const updatedService = await salonbook.findOne({
+            _id: serviceId,
+        });
+
+        return res.status(200).json({
+            success: true,
+            message: "Service updated successfully",
+            service: updatedService,
+        });
+
+    } catch (error) {
+        console.error("Update service error:", error);
+
+        return res.status(500).json({
+            success: false,
+            message: "Failed to update service",
+        });
+    }
+});
+
+
 
 
 
