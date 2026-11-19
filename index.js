@@ -551,6 +551,46 @@ app.get("/admin/services", verifyAdmin, async (req, res) => {
 
 
 
+app.get("/admin/services/:id", verifyAdmin, async (req, res) => {
+    try {
+        const { id } = req.params;
+
+        if (!ObjectId.isValid(id)) {
+            return res.status(400).json({
+                success: false,
+                message: "Invalid service ID",
+            });
+        }
+
+        const service = await salonbook.findOne({
+            _id: new ObjectId(id),
+        });
+
+        if (!service) {
+            return res.status(404).json({
+                success: false,
+                message: "Service not found",
+            });
+        }
+
+        return res.status(200).json({
+            success: true,
+            service,
+        });
+
+    } catch (error) {
+        console.error("Admin fetch single service error:", error);
+
+        return res.status(500).json({
+            success: false,
+            message: "Failed to fetch service",
+        });
+    }
+});
+
+
+
+
 // appoinments related api
 
 app.post("/appointments", verifyCustomer, async (req, res) => {
