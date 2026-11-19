@@ -32,6 +32,8 @@ const db = ConnectedClient.db('Salon-Book');
 const users = db.collection("user");
 const salonbook = db.collection("salonbook");
 const appointments = db.collection("appointments");
+const transactions = db.collection("transactions");
+
 
 
 const TIME_SLOTS = [
@@ -156,6 +158,95 @@ const verifyCustomer = async (req, res, next) => {
 };
 
 
+
+const verifyAdmin = async (req, res, next) => {
+    try {
+        const authHeader = req.headers.authorization;
+
+        if (!authHeader || !authHeader.startsWith("Bearer ")) {
+            return res.status(401).json({
+                success: false,
+                message: "Authentication required",
+            });
+        }
+
+        const token = authHeader.split(" ")[1];
+
+        const { payload } = await jwtVerify(token, JWKS, {
+            issuer: process.env.BETTER_AUTH_ISSUER,
+            audience: process.env.BETTER_AUTH_AUDIENCE,
+        });
+
+        if (!payload.sub) {
+            return res.status(401).json({
+                success: false,
+                message: "Invalid authentication token",
+            });
+        }
+
+        const userId = payload.sub;
+
+        const userFilters = [
+            { _id: userId },
+            { id: userId },
+        ];
+
+        if (ObjectId.isValid(userId)) {
+            userFilters.push({
+                _id: new ObjectId(userId),
+            });
+        }
+
+        const user = await users.findOne({
+            $or: userFilters,
+        });
+
+        if (!user) {
+            return res.status(401).json({
+                success: false,
+                message: "User not found",
+            });
+        }
+
+        if (user.isBlocked === true) {
+            return res.status(403).json({
+                success: false,
+                message: "Your account has been blocked",
+            });
+        }
+
+        if (user.role !== "admin") {
+            return res.status(403).json({
+                success: false,
+                message: "Only admins can perform this action",
+            });
+        }
+
+        req.authUser = {
+            id: userId,
+            name: user.name || "",
+            email: user.email || "",
+            role: user.role,
+            image: user.image || "",
+            phone: user.phone || "",
+            mongoId: user._id,
+        };
+
+        next();
+
+    } catch (error) {
+        console.error("JWT verification error:", error.message);
+
+        return res.status(401).json({
+            success: false,
+            message: "Invalid or expired authentication token",
+        });
+    }
+};
+
+
+
+
 function getAppointmentDateTime(date, timeSlot) {
     const [clock, period] = timeSlot.split(" ");
     const [hourString, minuteString] = clock.split(":");
@@ -181,8 +272,8 @@ app.get('/', async (req, res) => {
     res.send('Salon Book Server is Running Succesfully')
 })
 
-// user related api
 
+// user related api
 
 app.get("/users/me", verifyCustomer, async (req, res) => {
   try {
@@ -628,6 +719,62 @@ app.patch("/appointments/:id/cancel", verifyCustomer, async (req, res) => {
     }
 });
 
+
+// admin dashboard related api 
+
+app.get("/admin/dashboard/stats", verifyAdmin, async (req, res) => {
+    try {
+        const [
+            totalCustomers,
+            totalActiveServices,
+            totalAppointments,
+            pendingAppointments,
+            confirmedAppointments,
+            totalSuccessfulPayments,
+        ] = await Promise.all([
+            users.countDocuments({
+                role: "customer",
+            }),
+
+            salonbook.countDocuments({
+                status: "active",
+            }),
+
+            appointments.countDocuments({}),
+
+            appointments.countDocuments({
+                status: "pending",
+            }),
+
+            appointments.countDocuments({
+                status: "confirmed",
+            }),
+
+            transactions.countDocuments({
+                status: "paid",
+            }),
+        ]);
+
+        return res.status(200).json({
+            success: true,
+            stats: {
+                totalCustomers,
+                totalActiveServices,
+                totalAppointments,
+                pendingAppointments,
+                confirmedAppointments,
+                totalSuccessfulPayments,
+            },
+        });
+    } catch (error) {
+        console.error("Admin dashboard stats error:", error);
+
+        return res.status(500).json({
+            success: false,
+            message: "Failed to load dashboard statistics.",
+        });
+    }
+});
 
 
 app.listen(port, () => {
