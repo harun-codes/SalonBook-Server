@@ -273,6 +273,7 @@ app.get('/', async (req, res) => {
 })
 
 
+
 // user related api
 
 app.get("/users/me", verifyCustomer, async (req, res) => {
@@ -297,7 +298,6 @@ app.get("/users/me", verifyCustomer, async (req, res) => {
     });
   }
 });
-
 
 
 app.patch("/users/me", verifyCustomer, async (req, res) => {
@@ -426,6 +426,419 @@ app.patch("/users/me", verifyCustomer, async (req, res) => {
 });
 
 
+app.get("/admin/users", verifyAdmin, async (req, res) => {
+    try {
+        const search =
+            typeof req.query.search === "string"
+                ? req.query.search.trim().slice(0, 100)
+                : "";
+
+        const pageParam =
+            typeof req.query.page === "string"
+                ? parseInt(req.query.page, 10)
+                : 1;
+
+        const limitParam =
+            typeof req.query.limit === "string"
+                ? parseInt(req.query.limit, 10)
+                : 10;
+
+        const page =
+            Number.isInteger(pageParam) && pageParam > 0
+                ? pageParam
+                : 1;
+
+        const limit =
+            Number.isInteger(limitParam) && limitParam > 0
+                ? Math.min(limitParam, 100)
+                : 10;
+
+        const blocked =
+            typeof req.query.blocked === "string"
+                ? req.query.blocked.toLowerCase()
+                : "all";
+
+        if (!["all", "true", "false"].includes(blocked)) {
+            return res.status(400).json({
+                success: false,
+                message: "Invalid blocked status filter",
+            });
+        }
+
+        const filter = {
+            role: "customer",
+        };
+
+        if (blocked === "true") {
+            filter.isBlocked = true;
+        }
+
+        if (blocked === "false") {
+            filter.isBlocked = { $ne: true };
+        }
+
+        if (search) {
+            const escapedSearch = search.replace(
+                /[.*+?^${}()|[\]\\]/g,
+                "\\$&"
+            );
+
+            const searchRegex = new RegExp(escapedSearch, "i");
+
+            filter.$or = [
+                { name: searchRegex },
+                { email: searchRegex },
+                { phone: searchRegex },
+            ];
+        }
+
+        const total = await users.countDocuments(filter);
+
+        const customerUsers = await users
+            .find(filter, {
+                projection: {
+                    name: 1,
+                    email: 1,
+                    phone: 1,
+                    image: 1,
+                    role: 1,
+                    isBlocked: 1,
+                    id: 1,
+                    createdAt: 1,
+                    updatedAt: 1,
+                },
+            })
+            .sort({ createdAt: -1 })
+            .skip((page - 1) * limit)
+            .limit(limit)
+            .toArray();
+
+        const result = customerUsers.map((user) => ({
+            id: user.id || user._id.toString(),
+            name: user.name || "",
+            email: user.email || "",
+            phone: user.phone || "",
+            image: user.image || "",
+            role: user.role,
+            isBlocked: user.isBlocked === true,
+            createdAt: user.createdAt || null,
+            updatedAt: user.updatedAt || null,
+        }));
+
+        return res.status(200).json({
+            success: true,
+            count: total,
+            page,
+            limit,
+            totalPages: Math.ceil(total / limit),
+            users: result,
+        });
+
+    } catch (error) {
+        console.error("Admin fetch users error:", error);
+
+        return res.status(500).json({
+            success: false,
+            message: "Failed to fetch users",
+        });
+    }
+});
+
+
+app.get("/admin/users/:id", verifyAdmin, async (req, res) => {
+    try {
+        const { id } = req.params;
+
+        if (!id || id.trim().length > 128) {
+            return res.status(400).json({
+                success: false,
+                message: "Invalid user ID",
+            });
+        }
+
+        const userFilters = [
+            { id },
+            { _id: id },
+        ];
+
+        if (ObjectId.isValid(id)) {
+            userFilters.push({
+                _id: new ObjectId(id),
+            });
+        }
+
+        const user = await users.findOne(
+            {
+                $and: [
+                    { $or: userFilters },
+                    { role: "customer" },
+                ],
+            },
+            {
+                projection: {
+                    name: 1,
+                    email: 1,
+                    phone: 1,
+                    image: 1,
+                    role: 1,
+                    isBlocked: 1,
+                    createdAt: 1,
+                    updatedAt: 1,
+                    id: 1,
+                },
+            }
+        );
+
+        if (!user) {
+            return res.status(404).json({
+                success: false,
+                message: "Customer not found",
+            });
+        }
+
+        return res.status(200).json({
+            success: true,
+            user: {
+                id: user.id || user._id.toString(),
+                name: user.name || "",
+                email: user.email || "",
+                phone: user.phone || "",
+                image: user.image || "",
+                role: user.role,
+                isBlocked: user.isBlocked === true,
+                createdAt: user.createdAt || null,
+                updatedAt: user.updatedAt || null,
+            },
+        });
+
+    } catch (error) {
+        console.error("Admin fetch user details error:", error);
+
+        return res.status(500).json({
+            success: false,
+            message: "Failed to fetch customer details",
+        });
+    }
+});
+
+
+app.patch("/admin/users/:id/block", verifyAdmin, async (req, res) => {
+    try {
+        const { id } = req.params;
+
+        if (!id || id.trim().length > 128) {
+            return res.status(400).json({
+                success: false,
+                message: "Invalid user ID",
+            });
+        }
+
+        const userFilters = [
+            { id },
+            { _id: id },
+        ];
+
+        if (ObjectId.isValid(id)) {
+            userFilters.push({
+                _id: new ObjectId(id),
+            });
+        }
+
+        const customerFilter = {
+            $and: [
+                { $or: userFilters },
+                { role: "customer" },
+            ],
+        };
+
+        const customer = await users.findOne(customerFilter);
+
+        if (!customer) {
+            return res.status(404).json({
+                success: false,
+                message: "Customer not found",
+            });
+        }
+
+        if (customer.isBlocked === true) {
+            return res.status(409).json({
+                success: false,
+                message: "Customer is already blocked",
+            });
+        }
+
+        await users.updateOne(
+            {
+                _id: customer._id,
+                role: "customer",
+                isBlocked: { $ne: true },
+            },
+            {
+                $set: {
+                    isBlocked: true,
+                    updatedAt: new Date(),
+                },
+            }
+        );
+
+        const updatedCustomer = await users.findOne(
+            { _id: customer._id },
+            {
+                projection: {
+                    name: 1,
+                    email: 1,
+                    phone: 1,
+                    image: 1,
+                    role: 1,
+                    isBlocked: 1,
+                    id: 1,
+                    updatedAt: 1,
+                },
+            }
+        );
+
+        if (!updatedCustomer || updatedCustomer.isBlocked !== true) {
+            return res.status(409).json({
+                success: false,
+                message: "Unable to block customer",
+            });
+        }
+
+        return res.status(200).json({
+            success: true,
+            message: "Customer blocked successfully",
+            user: {
+                id: updatedCustomer.id || updatedCustomer._id.toString(),
+                name: updatedCustomer.name || "",
+                email: updatedCustomer.email || "",
+                phone: updatedCustomer.phone || "",
+                image: updatedCustomer.image || "",
+                role: updatedCustomer.role,
+                isBlocked: updatedCustomer.isBlocked,
+                updatedAt: updatedCustomer.updatedAt,
+            },
+        });
+
+    } catch (error) {
+        console.error("Block customer error:", error);
+
+        return res.status(500).json({
+            success: false,
+            message: "Failed to block customer",
+        });
+    }
+});
+
+
+app.patch("/admin/users/:id/unblock", verifyAdmin, async (req, res) => {
+    try {
+        const { id } = req.params;
+
+        if (!id || id.trim().length > 128) {
+            return res.status(400).json({
+                success: false,
+                message: "Invalid user ID",
+            });
+        }
+
+        const userFilters = [
+            { id },
+            { _id: id },
+        ];
+
+        if (ObjectId.isValid(id)) {
+            userFilters.push({
+                _id: new ObjectId(id),
+            });
+        }
+
+        const customerFilter = {
+            $and: [
+                { $or: userFilters },
+                { role: "customer" },
+            ],
+        };
+
+        const customer = await users.findOne(customerFilter);
+
+        if (!customer) {
+            return res.status(404).json({
+                success: false,
+                message: "Customer not found",
+            });
+        }
+
+        if (customer.isBlocked !== true) {
+            return res.status(409).json({
+                success: false,
+                message: "Customer is already active",
+            });
+        }
+
+        const result = await users.updateOne(
+            {
+                _id: customer._id,
+                role: "customer",
+                isBlocked: true,
+            },
+            {
+                $set: {
+                    isBlocked: false,
+                    updatedAt: new Date(),
+                },
+            }
+        );
+
+        if (result.matchedCount === 0) {
+            return res.status(409).json({
+                success: false,
+                message: "Customer status has already changed",
+            });
+        }
+
+        const updatedCustomer = await users.findOne(
+            { _id: customer._id },
+            {
+                projection: {
+                    name: 1,
+                    email: 1,
+                    phone: 1,
+                    image: 1,
+                    role: 1,
+                    isBlocked: 1,
+                    id: 1,
+                    updatedAt: 1,
+                },
+            }
+        );
+
+        return res.status(200).json({
+            success: true,
+            message: "Customer unblocked successfully",
+            user: {
+                id: updatedCustomer.id || updatedCustomer._id.toString(),
+                name: updatedCustomer.name || "",
+                email: updatedCustomer.email || "",
+                phone: updatedCustomer.phone || "",
+                image: updatedCustomer.image || "",
+                role: updatedCustomer.role,
+                isBlocked: updatedCustomer.isBlocked,
+                updatedAt: updatedCustomer.updatedAt,
+            },
+        });
+
+    } catch (error) {
+        console.error("Unblock customer error:", error);
+
+        return res.status(500).json({
+            success: false,
+            message: "Failed to unblock customer",
+        });
+    }
+});
+
+
+
 
 // services related Api
 
@@ -550,7 +963,6 @@ app.get("/admin/services", verifyAdmin, async (req, res) => {
 });
 
 
-
 app.get("/admin/services/:id", verifyAdmin, async (req, res) => {
     try {
         const { id } = req.params;
@@ -587,6 +999,32 @@ app.get("/admin/services/:id", verifyAdmin, async (req, res) => {
         });
     }
 });
+
+
+const isValidImgBBUrl = (value) => {
+    if (
+        typeof value !== "string" ||
+        !value.trim() ||
+        value.trim().length > 2048
+    ) {
+        return false;
+    }
+
+    try {
+        const imageUrl = new URL(value.trim());
+
+        return (
+            imageUrl.protocol === "https:" &&
+            ["i.ibb.co", "ibb.co"].includes(
+                imageUrl.hostname.toLowerCase()
+            ) &&
+            !imageUrl.username &&
+            !imageUrl.password
+        );
+    } catch {
+        return false;
+    }
+};
 
 
 app.post("/admin/services", verifyAdmin, async (req, res) => {
@@ -673,29 +1111,11 @@ app.post("/admin/services", verifyAdmin, async (req, res) => {
             });
         }
 
-        if (typeof image !== "string" || cleanImage.length > 2048) {
+        if (!cleanImage || !isValidImgBBUrl(cleanImage)) {
             return res.status(400).json({
                 success: false,
-                message: "Invalid service image",
+                message: "Please upload a valid ImgBB service image",
             });
-        }
-
-        if (cleanImage) {
-            try {
-                const imageUrl = new URL(cleanImage);
-
-                if (imageUrl.protocol !== "https:") {
-                    return res.status(400).json({
-                        success: false,
-                        message: "Service image must use HTTPS",
-                    });
-                }
-            } catch {
-                return res.status(400).json({
-                    success: false,
-                    message: "Invalid service image URL",
-                });
-            }
         }
 
         if (!["active", "inactive"].includes(cleanStatus)) {
@@ -737,7 +1157,6 @@ app.post("/admin/services", verifyAdmin, async (req, res) => {
         });
     }
 });
-
 
 
 app.patch("/admin/services/:id", verifyAdmin, async (req, res) => {
@@ -846,22 +1265,11 @@ app.patch("/admin/services/:id", verifyAdmin, async (req, res) => {
 
             const image = body.image.trim();
 
-            if (image) {
-                try {
-                    const imageUrl = new URL(image);
-
-                    if (imageUrl.protocol !== "https:") {
-                        return res.status(400).json({
-                            success: false,
-                            message: "Service image must use HTTPS",
-                        });
-                    }
-                } catch {
-                    return res.status(400).json({
-                        success: false,
-                        message: "Invalid service image URL",
-                    });
-                }
+            if (image && !isValidImgBBUrl(image)) {
+                return res.status(400).json({
+                    success: false,
+                    message: "Please provide a valid ImgBB image URL",
+                });
             }
 
             updates.image = image;
@@ -1472,6 +1880,137 @@ app.get("/admin/appointments/:id", verifyAdmin, async (req, res) => {
 });
 
 
+app.patch("/admin/appointments/:id/confirm", verifyAdmin, async (req, res) => {
+    try {
+        const { id } = req.params;
+
+        if (!ObjectId.isValid(id)) {
+            return res.status(400).json({
+                success: false,
+                message: "Invalid appointment ID",
+            });
+        }
+
+        const appointmentId = new ObjectId(id);
+
+        const result = await appointments.updateOne(
+            {
+                _id: appointmentId,
+                status: "pending",
+            },
+            {
+                $set: {
+                    status: "confirmed",
+                    confirmedAt: new Date(),
+                    updatedAt: new Date(),
+                },
+            }
+        );
+
+        if (result.matchedCount === 0) {
+            const existingAppointment = await appointments.findOne({
+                _id: appointmentId,
+            });
+
+            if (!existingAppointment) {
+                return res.status(404).json({
+                    success: false,
+                    message: "Appointment not found",
+                });
+            }
+
+            return res.status(409).json({
+                success: false,
+                message: "Only pending appointments can be confirmed",
+            });
+        }
+
+        const updatedAppointment = await appointments.findOne({
+            _id: appointmentId,
+        });
+
+        return res.status(200).json({
+            success: true,
+            message: "Appointment confirmed successfully",
+            appointment: updatedAppointment,
+        });
+
+    } catch (error) {
+        console.error("Confirm appointment error:", error);
+
+        return res.status(500).json({
+            success: false,
+            message: "Failed to confirm appointment",
+        });
+    }
+});
+
+
+
+app.patch("/admin/appointments/:id/cancel", verifyAdmin, async (req, res) => {
+    try {
+        const { id } = req.params;
+
+        if (!ObjectId.isValid(id)) {
+            return res.status(400).json({
+                success: false,
+                message: "Invalid appointment ID",
+            });
+        }
+
+        const appointmentId = new ObjectId(id);
+
+        const result = await appointments.updateOne(
+            {
+                _id: appointmentId,
+                status: { $in: ["pending", "confirmed"] },
+            },
+            {
+                $set: {
+                    status: "cancelled",
+                    cancelledAt: new Date(),
+                    updatedAt: new Date(),
+                },
+            }
+        );
+
+        if (result.matchedCount === 0) {
+            const existingAppointment = await appointments.findOne({
+                _id: appointmentId,
+            });
+
+            if (!existingAppointment) {
+                return res.status(404).json({
+                    success: false,
+                    message: "Appointment not found",
+                });
+            }
+
+            return res.status(409).json({
+                success: false,
+                message: "Only pending or confirmed appointments can be cancelled",
+            });
+        }
+
+        const updatedAppointment = await appointments.findOne({
+            _id: appointmentId,
+        });
+
+        return res.status(200).json({
+            success: true,
+            message: "Appointment cancelled successfully",
+            appointment: updatedAppointment,
+        });
+
+    } catch (error) {
+        console.error("Admin cancel appointment error:", error);
+
+        return res.status(500).json({
+            success: false,
+            message: "Failed to cancel appointment",
+        });
+    }
+});
 
 
 // admin dashboard related api 
@@ -1529,6 +2068,214 @@ app.get("/admin/dashboard/stats", verifyAdmin, async (req, res) => {
         });
     }
 });
+
+
+// admin profile api
+
+app.get("/admin/profile", verifyAdmin, async (req, res) => {
+    try {
+        const admin = await users.findOne(
+            { _id: req.authUser.mongoId },
+            {
+                projection: {
+                    name: 1,
+                    email: 1,
+                    image: 1,
+                    phone: 1,
+                    role: 1,
+                    createdAt: 1,
+                    updatedAt: 1,
+                },
+            }
+        );
+
+        if (!admin) {
+            return res.status(404).json({
+                success: false,
+                message: "Admin profile not found",
+            });
+        }
+
+        return res.status(200).json({
+            success: true,
+            user: {
+                id: admin._id.toString(),
+                name: admin.name || "",
+                email: admin.email || "",
+                image: admin.image || "",
+                phone: admin.phone || "",
+                role: admin.role || "admin",
+                createdAt: admin.createdAt || null,
+                updatedAt: admin.updatedAt || null,
+            },
+        });
+    } catch (error) {
+        console.error("Fetch admin profile error:", error);
+
+        return res.status(500).json({
+            success: false,
+            message: "Failed to fetch admin profile",
+        });
+    }
+});
+
+
+app.patch("/admin/profile", verifyAdmin, async (req, res) => {
+    try {
+        const { name, phone, image } = req.body;
+
+        const updates = {};
+
+        if (name !== undefined) {
+            if (
+                typeof name !== "string" ||
+                name.trim().length < 2 ||
+                name.trim().length > 60
+            ) {
+                return res.status(400).json({
+                    success: false,
+                    message: "Name must contain 2-60 characters",
+                });
+            }
+
+            updates.name = name.trim();
+        }
+
+        if (phone !== undefined) {
+            if (
+                typeof phone !== "string" ||
+                phone.length > 25
+            ) {
+                return res.status(400).json({
+                    success: false,
+                    message: "Invalid phone number",
+                });
+            }
+
+            const cleanPhone = phone.trim();
+
+            if (
+                cleanPhone &&
+                !/^[+()\d\s-]{7,20}$/.test(cleanPhone)
+            ) {
+                return res.status(400).json({
+                    success: false,
+                    message: "Please provide a valid phone number",
+                });
+            }
+
+            updates.phone = cleanPhone;
+        }
+
+        if (image !== undefined) {
+            if (
+                typeof image !== "string" ||
+                image.length > 2048
+            ) {
+                return res.status(400).json({
+                    success: false,
+                    message: "Invalid profile image",
+                });
+            }
+
+            const cleanImage = image.trim();
+
+            if (cleanImage !== "") {
+                try {
+                    const imageUrl = new URL(cleanImage);
+
+                    if (
+                        imageUrl.protocol !== "https:" ||
+                        !imageUrl.hostname ||
+                        imageUrl.username ||
+                        imageUrl.password
+                    ) {
+                        return res.status(400).json({
+                            success: false,
+                            message: "Invalid profile image URL",
+                        });
+                    }
+                } catch {
+                    return res.status(400).json({
+                        success: false,
+                        message: "Invalid profile image URL",
+                    });
+                }
+            }
+
+            updates.image = cleanImage;
+        }
+
+        if (Object.keys(updates).length === 0) {
+            return res.status(400).json({
+                success: false,
+                message: "No profile information provided",
+            });
+        }
+
+        const result = await users.updateOne(
+            { _id: req.authUser.mongoId },
+            {
+                $set: {
+                    ...updates,
+                    updatedAt: new Date(),
+                },
+            }
+        );
+
+        if (result.matchedCount === 0) {
+            return res.status(404).json({
+                success: false,
+                message: "Admin not found",
+            });
+        }
+
+        const updatedAdmin = await users.findOne(
+            { _id: req.authUser.mongoId },
+            {
+                projection: {
+                    name: 1,
+                    email: 1,
+                    image: 1,
+                    phone: 1,
+                    role: 1,
+                    createdAt: 1,
+                    updatedAt: 1,
+                },
+            }
+        );
+
+        if (!updatedAdmin) {
+            return res.status(404).json({
+                success: false,
+                message: "Admin profile not found",
+            });
+        }
+
+        return res.status(200).json({
+            success: true,
+            message: "Admin profile updated successfully",
+            user: {
+                id: updatedAdmin._id.toString(),
+                name: updatedAdmin.name || "",
+                email: updatedAdmin.email || "",
+                image: updatedAdmin.image || "",
+                phone: updatedAdmin.phone || "",
+                role: updatedAdmin.role || "admin",
+                createdAt: updatedAdmin.createdAt || null,
+                updatedAt: updatedAdmin.updatedAt || null,
+            },
+        });
+    } catch (error) {
+        console.error("Update admin profile error:", error);
+
+        return res.status(500).json({
+            success: false,
+            message: "Failed to update admin profile",
+        });
+    }
+});
+
 
 
 app.listen(port, () => {
