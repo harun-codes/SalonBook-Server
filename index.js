@@ -1390,6 +1390,90 @@ app.get("/admin/appointments", verifyAdmin, async (req, res) => {
 });
 
 
+app.get("/admin/appointments/:id", verifyAdmin, async (req, res) => {
+    try {
+        const { id } = req.params;
+
+        if (!ObjectId.isValid(id)) {
+            return res.status(400).json({
+                success: false,
+                message: "Invalid appointment ID",
+            });
+        }
+
+        const appointment = await appointments.findOne({
+            _id: new ObjectId(id),
+        });
+
+        if (!appointment) {
+            return res.status(404).json({
+                success: false,
+                message: "Appointment not found",
+            });
+        }
+
+        const service = ObjectId.isValid(appointment.serviceId)
+            ? await salonbook.findOne({
+                _id: new ObjectId(appointment.serviceId),
+            })
+            : null;
+
+        const userFilters = [
+            { _id: appointment.customerId },
+            { id: appointment.customerId },
+        ];
+
+        if (ObjectId.isValid(appointment.customerId)) {
+            userFilters.push({
+                _id: new ObjectId(appointment.customerId),
+            });
+        }
+
+        const customer = await users.findOne(
+            { $or: userFilters },
+            {
+                projection: {
+                    name: 1,
+                    email: 1,
+                    phone: 1,
+                    image: 1,
+                    role: 1,
+                    id: 1,
+                },
+            }
+        );
+
+        return res.status(200).json({
+            success: true,
+            appointment: {
+                ...appointment,
+                _id: appointment._id.toString(),
+                service: service || null,
+                customer: customer
+                    ? {
+                        id: customer.id || customer._id.toString(),
+                        name: customer.name || "",
+                        email: customer.email || "",
+                        phone: customer.phone || "",
+                        image: customer.image || "",
+                    }
+                    : null,
+            },
+        });
+
+    } catch (error) {
+        console.error("Admin fetch appointment details error:", error);
+
+        return res.status(500).json({
+            success: false,
+            message: "Failed to fetch appointment details",
+        });
+    }
+});
+
+
+
+
 // admin dashboard related api 
 
 app.get("/admin/dashboard/stats", verifyAdmin, async (req, res) => {
