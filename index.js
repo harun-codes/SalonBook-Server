@@ -1244,6 +1244,152 @@ app.patch("/appointments/:id/cancel", verifyCustomer, async (req, res) => {
 });
 
 
+app.get("/admin/appointments", verifyAdmin, async (req, res) => {
+    try {
+        const status =
+            typeof req.query.status === "string"
+                ? req.query.status.trim().toLowerCase()
+                : "";
+
+        const page = Math.max(
+            parseInt(req.query.page, 10) || 1,
+            1
+        );
+
+        const limit = Math.min(
+            Math.max(parseInt(req.query.limit, 10) || 10, 1),
+            100
+        );
+
+        const filter = {};
+
+        if (status && status !== "all") {
+            filter.status = status;
+        }
+
+        const total = await appointments.countDocuments(filter);
+
+        const appointmentList = await appointments
+            .find(filter)
+            .sort({ createdAt: -1 })
+            .skip((page - 1) * limit)
+            .limit(limit)
+            .toArray();
+
+        const serviceIds = [
+            ...new Set(
+                appointmentList
+                    .map((appointment) => appointment.serviceId)
+                    .filter((id) => ObjectId.isValid(id))
+            ),
+        ].map((id) => new ObjectId(id));
+
+        const customerIds = [
+            ...new Set(
+                appointmentList
+                    .map((appointment) => appointment.customerId)
+                    .filter(Boolean)
+            ),
+        ];
+
+        const [services, customers] = await Promise.all([
+            serviceIds.length
+                ? salonbook.find({
+                    _id: { $in: serviceIds },
+                }).toArray()
+                : [],
+
+            customerIds.length
+                ? users.find(
+                    {
+                        $or: customerIds.flatMap((id) => [
+                            { id },
+                            { _id: id },
+                            ...(ObjectId.isValid(id)
+                                ? [{ _id: new ObjectId(id) }]
+                                : []),
+                        ]),
+                    },
+                    {
+                        projection: {
+                            name: 1,
+                            email: 1,
+                            phone: 1,
+                            image: 1,
+                            role: 1,
+                            id: 1,
+                        },
+                    }
+                ).toArray()
+                : [],
+        ]);
+
+        const serviceMap = new Map(
+            services.map((service) => [
+                service._id.toString(),
+                service,
+            ])
+        );
+
+        const customerMap = new Map();
+
+        customers.forEach((customer) => {
+            if (customer.id) {
+                customerMap.set(String(customer.id), customer);
+            }
+
+            if (customer._id) {
+                customerMap.set(
+                    customer._id.toString(),
+                    customer
+                );
+            }
+        });
+
+        const result = appointmentList.map((appointment) => {
+            const customer = customerMap.get(
+                appointment.customerId
+            );
+
+            return {
+                ...appointment,
+                _id: appointment._id.toString(),
+
+                service:
+                    serviceMap.get(appointment.serviceId) || null,
+
+                customer: customer
+                    ? {
+                        id: customer.id || customer._id.toString(),
+                        name: customer.name || "",
+                        email: customer.email || "",
+                        phone: customer.phone || "",
+                        image: customer.image || "",
+                    }
+                    : null,
+            };
+        });
+
+        return res.status(200).json({
+            success: true,
+            count: total,
+            page,
+            limit,
+            totalPages: Math.ceil(total / limit),
+            appointments: result,
+        });
+
+    } catch (error) {
+        console.error("Admin fetch appointments error:", error);
+
+        return res.status(500).json({
+            success: false,
+            message: "Failed to fetch appointments",
+        });
+    }
+});
+
+
 // admin dashboard related api 
 
 app.get("/admin/dashboard/stats", verifyAdmin, async (req, res) => {
