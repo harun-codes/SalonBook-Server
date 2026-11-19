@@ -925,6 +925,72 @@ app.patch("/admin/services/:id", verifyAdmin, async (req, res) => {
 });
 
 
+app.delete("/admin/services/:id", verifyAdmin, async (req, res) => {
+    try {
+        const { id } = req.params;
+
+        if (!ObjectId.isValid(id)) {
+            return res.status(400).json({
+                success: false,
+                message: "Invalid service ID",
+            });
+        }
+
+        const serviceId = new ObjectId(id);
+
+        const service = await salonbook.findOne({
+            _id: serviceId,
+        });
+
+        if (!service) {
+            return res.status(404).json({
+                success: false,
+                message: "Service not found",
+            });
+        }
+
+        const linkedAppointments = await appointments.countDocuments({
+            $or: [
+                { serviceId: id },
+                { serviceId: serviceId },
+            ],
+        });
+
+        if (linkedAppointments > 0) {
+            return res.status(409).json({
+                success: false,
+                message:
+                    "This service has appointment records. Deactivate it instead of deleting.",
+                linkedAppointments,
+            });
+        }
+
+        const result = await salonbook.deleteOne({
+            _id: serviceId,
+        });
+
+        if (result.deletedCount === 0) {
+            return res.status(404).json({
+                success: false,
+                message: "Service not found",
+            });
+        }
+
+        return res.status(200).json({
+            success: true,
+            message: "Service deleted successfully",
+        });
+
+    } catch (error) {
+        console.error("Delete service error:", error);
+
+        return res.status(500).json({
+            success: false,
+            message: "Failed to delete service",
+        });
+    }
+});
+
 
 
 
