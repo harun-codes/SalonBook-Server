@@ -471,6 +471,86 @@ app.get('/services/:id', async (req, res) => {
 });
 
 
+
+app.get("/admin/services", verifyAdmin, async (req, res) => {
+    try {
+        const filter = {};
+
+        const search = req.query.search;
+        const status = req.query.status;
+
+        if (status !== undefined) {
+            if (
+                typeof status !== "string" ||
+                !["all", "active", "inactive"].includes(status.toLowerCase())
+            ) {
+                return res.status(400).json({
+                    success: false,
+                    message: "Invalid service status",
+                });
+            }
+
+            if (status.toLowerCase() !== "all") {
+                filter.status = status.toLowerCase();
+            }
+        }
+
+        if (search !== undefined) {
+            if (typeof search !== "string") {
+                return res.status(400).json({
+                    success: false,
+                    message: "Invalid search query",
+                });
+            }
+
+            const cleanSearch = search.trim();
+
+            if (cleanSearch) {
+                const safeSearch = cleanSearch.replace(
+                    /[.*+?^${}()|[\]\\]/g,
+                    "\\$&"
+                );
+
+                filter.$or = [
+                    {
+                        serviceName: {
+                            $regex: safeSearch,
+                            $options: "i",
+                        },
+                    },
+                    {
+                        category: {
+                            $regex: safeSearch,
+                            $options: "i",
+                        },
+                    },
+                ];
+            }
+        }
+
+        const services = await salonbook
+            .find(filter)
+            .sort({ createdAt: -1 })
+            .toArray();
+
+        return res.status(200).json({
+            success: true,
+            count: services.length,
+            services,
+        });
+
+    } catch (error) {
+        console.error("Admin fetch services error:", error);
+
+        return res.status(500).json({
+            success: false,
+            message: "Failed to fetch services",
+        });
+    }
+});
+
+
+
 // appoinments related api
 
 app.post("/appointments", verifyCustomer, async (req, res) => {
