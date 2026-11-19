@@ -589,6 +589,159 @@ app.get("/admin/services/:id", verifyAdmin, async (req, res) => {
 });
 
 
+app.post("/admin/services", verifyAdmin, async (req, res) => {
+    try {
+        const {
+            serviceName,
+            category,
+            description,
+            price,
+            duration,
+            image = "",
+            status = "active",
+        } = req.body || {};
+
+        const cleanName =
+            typeof serviceName === "string"
+                ? serviceName.trim()
+                : "";
+
+        const cleanCategory =
+            typeof category === "string"
+                ? category.trim()
+                : "";
+
+        const cleanDescription =
+            typeof description === "string"
+                ? description.trim()
+                : "";
+
+        const cleanImage =
+            typeof image === "string"
+                ? image.trim()
+                : "";
+
+        const cleanStatus =
+            typeof status === "string"
+                ? status.toLowerCase()
+                : "";
+
+        const servicePrice = Number(price);
+        const serviceDuration = Number(duration);
+
+        if (cleanName.length < 2 || cleanName.length > 100) {
+            return res.status(400).json({
+                success: false,
+                message: "Service name must contain 2-100 characters",
+            });
+        }
+
+        if (cleanCategory.length < 2 || cleanCategory.length > 60) {
+            return res.status(400).json({
+                success: false,
+                message: "Invalid service category",
+            });
+        }
+
+        if (
+            !cleanDescription ||
+            cleanDescription.length > 2000
+        ) {
+            return res.status(400).json({
+                success: false,
+                message: "Description is required and must not exceed 2000 characters",
+            });
+        }
+
+        if (
+            !Number.isFinite(servicePrice) ||
+            servicePrice <= 0
+        ) {
+            return res.status(400).json({
+                success: false,
+                message: "Please provide a valid service price",
+            });
+        }
+
+        if (
+            !Number.isInteger(serviceDuration) ||
+            serviceDuration <= 0
+        ) {
+            return res.status(400).json({
+                success: false,
+                message: "Please provide a valid service duration",
+            });
+        }
+
+        if (typeof image !== "string" || cleanImage.length > 2048) {
+            return res.status(400).json({
+                success: false,
+                message: "Invalid service image",
+            });
+        }
+
+        if (cleanImage) {
+            try {
+                const imageUrl = new URL(cleanImage);
+
+                if (imageUrl.protocol !== "https:") {
+                    return res.status(400).json({
+                        success: false,
+                        message: "Service image must use HTTPS",
+                    });
+                }
+            } catch {
+                return res.status(400).json({
+                    success: false,
+                    message: "Invalid service image URL",
+                });
+            }
+        }
+
+        if (!["active", "inactive"].includes(cleanStatus)) {
+            return res.status(400).json({
+                success: false,
+                message: "Invalid service status",
+            });
+        }
+
+        const newService = {
+            serviceName: cleanName,
+            category: cleanCategory,
+            description: cleanDescription,
+            price: servicePrice,
+            duration: serviceDuration,
+            image: cleanImage,
+            status: cleanStatus,
+            createdAt: new Date(),
+            updatedAt: new Date(),
+        };
+
+        const result = await salonbook.insertOne(newService);
+
+        return res.status(201).json({
+            success: true,
+            message: "Service created successfully",
+            service: {
+                _id: result.insertedId,
+                ...newService,
+            },
+        });
+
+    } catch (error) {
+        console.error("Create service error:", error);
+
+        return res.status(500).json({
+            success: false,
+            message: "Failed to create service",
+        });
+    }
+});
+
+
+
+
+
 
 
 // appoinments related api
