@@ -3,9 +3,11 @@ import cors from 'cors';
 import { MongoClient, ObjectId } from 'mongodb';
 import 'dotenv/config';
 import { createRemoteJWKSet, jwtVerify } from "jose";
-
+import Stripe from 'stripe';
 const app = express();
 const port = process.env.PORT || 5000;
+
+const stripe = new Stripe(process.env.STRIPE_SECRET_KEY);
 
 
 app.use(cors({
@@ -13,7 +15,7 @@ app.use(cors({
     credentials: true,
 }));
 
-app.use(express.json());
+
 
 const client = new MongoClient(process.env.MONGODB_URI);
 
@@ -34,7 +36,560 @@ const salonbook = db.collection("salonbook");
 const appointments = db.collection("appointments");
 const transactions = db.collection("transactions");
 
+const stripeEvents = db.collection("stripeEvents");
 
+await stripeEvents.createIndex(
+    { eventId: 1 },
+    { unique: true }
+);
+
+async function markStripeEventProcessed(event) {
+    try {
+        await stripeEvents.updateOne(
+            {
+                eventId: event.id,
+            },
+            {
+                $setOnInsert: {
+                    eventId: event.id,
+                    eventType: event.type,
+                    status: "processed",
+                    processedAt: new Date(),
+                },
+            },
+            {
+                upsert: true,
+            }
+        );
+    } catch (error) {
+        if (error.code !== 11000) {
+            throw error;
+        }
+    }
+}
+
+app.post("/webhooks/stripe", express.raw({ type: "application/json" }),
+    async (req, res) => {
+        const signature = req.headers["stripe-signature"];
+        const webhookSecret = process.env.STRIPE_WEBHOOK_SECRET;
+
+        if (!webhookSecret) {
+            console.error("Stripe webhook secret is missing");
+
+            return res.status(500).json({
+                success: false,
+                message: "Webhook secret is not configured",
+            });
+        }
+
+        if (!signature || !Buffer.isBuffer(req.body)) {
+            return res.status(400).json({
+                success: false,
+                message: "Invalid webhook request",
+            });
+        }
+
+        let event;
+
+        try {
+            event = stripe.webhooks.constructEvent(
+                req.body,
+                signature,
+                webhookSecret
+            );
+        } catch (error) {
+            console.error(
+                "Webhook signature verification failed:",
+                error.message
+            );
+
+            return res.status(400).json({
+                success: false,
+                message: "Invalid Stripe webhook signature",
+            });
+        }
+
+        try {
+            const alreadyProcessed = await stripeEvents.findOne({
+                eventId: event.id,
+            });
+
+            if (alreadyProcessed) {
+                console.log("Duplicate Stripe event ignored:", event.id);
+
+                return res.status(200).json({
+                    received: true,
+                    duplicate: true,
+                    message: "Event already processed",
+                });
+            }
+
+            switch (event.type) {
+
+                case "checkout.session.completed":
+                case "checkout.session.async_payment_succeeded": {
+                    const session = event.data.object;
+
+                    if (
+                        session.mode !== "payment" ||
+                        session.payment_status !== "paid"
+                    ) {
+                        return res.status(200).json({
+                            received: true,
+                            message: "Payment is not completed yet",
+                        });
+                    }
+
+                    const {
+                        appointmentId,
+                        customerId,
+                        serviceId,
+                    } = session.metadata || {};
+
+                    if (
+                        !appointmentId ||
+                        !ObjectId.isValid(appointmentId) ||
+                        !customerId ||
+                        !serviceId ||
+                        session.client_reference_id !== appointmentId
+                    ) {
+                        console.error(
+                            "Invalid appointment metadata:",
+                            session.id
+                        );
+
+                        return res.status(400).json({
+                            received: false,
+                            message: "Invalid payment metadata",
+                        });
+                    }
+
+                    const transaction = await transactions.findOne({
+                        stripeSessionId: session.id,
+                        appointmentId,
+                        customerId,
+                    });
+
+                    if (!transaction) {
+                        console.error(
+                            "Transaction not found:",
+                            session.id
+                        );
+
+                        return res.status(500).json({
+                            received: false,
+                            message: "Transaction not found",
+                        });
+                    }
+
+                    if (
+                        String(transaction.serviceId) !== String(serviceId)
+                    ) {
+                        return res.status(400).json({
+                            received: false,
+                            message: "Service reference mismatch",
+                        });
+                    }
+
+                    const expectedAmount = Math.round(
+                        Number(transaction.amount) * 100
+                    );
+
+                    const expectedCurrency = String(
+                        transaction.currency || ""
+                    ).toLowerCase();
+
+                    if (
+                        !Number.isSafeInteger(expectedAmount) ||
+                        expectedAmount <= 0 ||
+                        session.amount_total !== expectedAmount ||
+                        session.currency !== expectedCurrency
+                    ) {
+                        console.error(
+                            "Payment amount or currency mismatch:",
+                            session.id
+                        );
+
+                        return res.status(400).json({
+                            received: false,
+                            message: "Payment amount or currency mismatch",
+                        });
+                    }
+
+                    const appointmentObjectId = new ObjectId(
+                        appointmentId
+                    );
+
+                    const appointment = await appointments.findOne({
+                        _id: appointmentObjectId,
+                        customerId,
+                    });
+
+                    if (!appointment) {
+                        console.error(
+                            "Appointment not found:",
+                            appointmentId
+                        );
+
+                        return res.status(500).json({
+                            received: false,
+                            message: "Appointment not found",
+                        });
+                    }
+
+                    if (
+                        String(appointment.serviceId) !== String(serviceId)
+                    ) {
+                        return res.status(400).json({
+                            received: false,
+                            message: "Appointment service mismatch",
+                        });
+                    }
+
+                    const paymentIntentId =
+                        typeof session.payment_intent === "string"
+                            ? session.payment_intent
+                            : session.payment_intent?.id || null;
+
+                    const now = new Date();
+
+                    await transactions.updateOne(
+                        {
+                            _id: transaction._id,
+                            stripeSessionId: session.id,
+                        },
+                        {
+                            $set: {
+                                status: "paid",
+                                paymentStatus: "paid",
+                                stripePaymentIntentId: paymentIntentId,
+                                stripePaymentStatus: session.payment_status,
+                                lastStripeEventId: event.id,
+                                paidAt: transaction.paidAt || now,
+                                updatedAt: now,
+                            },
+                        }
+                    );
+
+                    const appointmentUpdate = await appointments.updateOne(
+                        {
+                            _id: appointmentObjectId,
+                            customerId,
+                        },
+                        {
+                            $set: {
+                                paymentStatus: "paid",
+                                stripePaymentIntentId: paymentIntentId,
+                                paidAt: appointment.paidAt || now,
+                                updatedAt: now,
+                            },
+                        }
+                    );
+
+                    if (appointmentUpdate.matchedCount === 0) {
+                        throw new Error(
+                            "Appointment payment update failed"
+                        );
+                    }
+
+                    await markStripeEventProcessed(event);
+
+                    console.log(
+                        "Stripe payment successfully verified:",
+                        session.id
+                    );
+
+                    return res.status(200).json({
+                        received: true,
+                        success: true,
+                        message: "Payment successfully recorded",
+                    });
+                }
+
+                case "checkout.session.async_payment_failed":
+                case "checkout.session.expired": {
+                    const session = event.data.object;
+
+                    const transaction = await transactions.findOne({
+                        stripeSessionId: session.id,
+                    });
+
+                    if (!transaction) {
+                        console.error(
+                            "Transaction not found for failed or expired session:",
+                            session.id
+                        );
+
+                        return res.status(500).json({
+                            received: false,
+                            message: "Transaction not found",
+                        });
+                    }
+
+                    const nextStatus =
+                        event.type === "checkout.session.expired"
+                            ? "expired"
+                            : "failed";
+
+                    const now = new Date();
+
+                    if (
+                        transaction.status !== "paid" &&
+                        transaction.paymentStatus !== "paid"
+                    ) {
+                        const transactionUpdate = await transactions.updateOne(
+                            {
+                                _id: transaction._id,
+                                status: { $ne: "paid" },
+                                paymentStatus: { $ne: "paid" },
+                            },
+                            {
+                                $set: {
+                                    status: nextStatus,
+                                    paymentStatus: "unpaid",
+                                    stripePaymentStatus: session.payment_status || "unpaid",
+                                    lastStripeEventId: event.id,
+                                    failureReason: event.type,
+                                    updatedAt: now,
+                                },
+                            }
+                        );
+
+                        if (
+                            transactionUpdate.matchedCount > 0 &&
+                            ObjectId.isValid(transaction.appointmentId)
+                        ) {
+                            await appointments.updateOne(
+                                {
+                                    _id: new ObjectId(transaction.appointmentId),
+                                    customerId: transaction.customerId,
+                                    paymentStatus: { $ne: "paid" },
+                                },
+                                {
+                                    $set: {
+                                        paymentStatus: "unpaid",
+                                        updatedAt: now,
+                                    },
+                                }
+                            );
+                        }
+                    }
+
+                    await markStripeEventProcessed(event);
+
+                    console.log(
+                        `Stripe checkout ${nextStatus}:`,
+                        session.id
+                    );
+
+                    return res.status(200).json({
+                        received: true,
+                        success: true,
+                        status: nextStatus,
+                        message: `Checkout ${nextStatus} successfully recorded`,
+                    });
+                }
+
+                case "payment_intent.payment_failed": {
+                    const paymentIntent = event.data.object;
+
+                    const {
+                        appointmentId,
+                        customerId,
+                        serviceId,
+                    } = paymentIntent.metadata || {};
+
+                    if (
+                        !appointmentId ||
+                        !ObjectId.isValid(appointmentId) ||
+                        !customerId ||
+                        !serviceId
+                    ) {
+                        console.error(
+                            "Invalid failed payment metadata:",
+                            paymentIntent.id
+                        );
+
+                        return res.status(400).json({
+                            received: false,
+                            message: "Invalid payment metadata",
+                        });
+                    }
+
+                    let transaction = await transactions.findOne({
+                        stripePaymentIntentId: paymentIntent.id,
+                    });
+
+                    if (!transaction) {
+                        transaction = await transactions.findOne({
+                            appointmentId,
+                            customerId,
+                            serviceId,
+                            status: "pending",
+                        });
+                    }
+
+                    if (!transaction) {
+                        console.error(
+                            "Transaction not found for failed payment:",
+                            paymentIntent.id
+                        );
+
+                        return res.status(500).json({
+                            received: false,
+                            message: "Transaction not found",
+                        });
+                    }
+
+                    if (
+                        String(transaction.appointmentId) !== String(appointmentId) ||
+                        String(transaction.customerId) !== String(customerId) ||
+                        String(transaction.serviceId) !== String(serviceId)
+                    ) {
+                        return res.status(400).json({
+                            received: false,
+                            message: "Transaction reference mismatch",
+                        });
+                    }
+
+                    const expectedAmount = Math.round(
+                        Number(transaction.amount) * 100
+                    );
+
+                    const expectedCurrency = String(
+                        transaction.currency || ""
+                    ).toLowerCase();
+
+                    if (
+                        !Number.isSafeInteger(expectedAmount) ||
+                        expectedAmount <= 0 ||
+                        paymentIntent.amount !== expectedAmount ||
+                        paymentIntent.currency !== expectedCurrency
+                    ) {
+                        return res.status(400).json({
+                            received: false,
+                            message: "Payment amount or currency mismatch",
+                        });
+                    }
+
+                    if (
+                        transaction.status === "paid" ||
+                        transaction.paymentStatus === "paid"
+                    ) {
+                        await markStripeEventProcessed(event);
+
+                        console.log(
+                            "Late payment failure event ignored for paid transaction:",
+                            paymentIntent.id
+                        );
+
+                        return res.status(200).json({
+                            received: true,
+                            success: true,
+                            message: "Payment already completed",
+                        });
+                    }
+
+                    const paymentError = paymentIntent.last_payment_error;
+                    const now = new Date();
+
+                    const transactionUpdate = await transactions.updateOne(
+                        {
+                            _id: transaction._id,
+                            status: { $ne: "paid" },
+                            paymentStatus: { $ne: "paid" },
+                        },
+                        {
+                            $set: {
+                                stripePaymentIntentId: paymentIntent.id,
+                                stripePaymentStatus: paymentIntent.status,
+                                paymentStatus: "unpaid",
+                                lastStripeEventId: event.id,
+                                failureReason:
+                                    paymentError?.decline_code ||
+                                    paymentError?.code ||
+                                    paymentError?.message ||
+                                    event.type,
+                                lastPaymentError: paymentError
+                                    ? {
+                                        type: paymentError.type || null,
+                                        code: paymentError.code || null,
+                                        declineCode: paymentError.decline_code || null,
+                                        message: paymentError.message || null,
+                                    }
+                                    : null,
+                                updatedAt: now,
+                            },
+                        }
+                    );
+
+                    if (transactionUpdate.matchedCount === 0) {
+                        const latestTransaction = await transactions.findOne({
+                            _id: transaction._id,
+                        });
+
+                        if (
+                            latestTransaction?.status === "paid" ||
+                            latestTransaction?.paymentStatus === "paid"
+                        ) {
+                            await markStripeEventProcessed(event);
+
+                            return res.status(200).json({
+                                received: true,
+                                success: true,
+                                message: "Payment already completed",
+                            });
+                        }
+
+                        throw new Error(
+                            "Failed payment transaction update failed"
+                        );
+                    }
+
+                    await markStripeEventProcessed(event);
+
+                    console.log(
+                        "Stripe payment attempt failed:",
+                        paymentIntent.id
+                    );
+
+                    return res.status(200).json({
+                        received: true,
+                        success: true,
+                        status: "pending",
+                        message: "Payment attempt failed. Checkout remains available for retry.",
+                    });
+                }
+
+                default:
+                    console.log(
+                        "Unhandled Stripe event:",
+                        event.type
+                    );
+
+                    return res.status(200).json({
+                        received: true,
+                        message: "Event ignored",
+                    });
+            }
+
+        } catch (error) {
+            console.error(
+                "Stripe webhook processing error:",
+                error
+            );
+
+            return res.status(500).json({
+                received: false,
+                message: "Webhook processing failed",
+            });
+        }
+    }
+);
+
+
+
+app.use(express.json());
 
 const TIME_SLOTS = [
     "10:00 AM",
@@ -274,155 +829,156 @@ app.get('/', async (req, res) => {
 
 
 
+
 // user related api
 
 app.get("/users/me", verifyCustomer, async (req, res) => {
-  try {
-    return res.status(200).json({
-      success: true,
-      user: {
-        id: req.authUser.id,
-        name: req.authUser.name,
-        email: req.authUser.email,
-        image: req.authUser.image,
-        phone: req.authUser.phone,
-        role: req.authUser.role,
-      },
-    });
-  } catch (error) {
-    console.error("Fetch profile error:", error);
+    try {
+        return res.status(200).json({
+            success: true,
+            user: {
+                id: req.authUser.id,
+                name: req.authUser.name,
+                email: req.authUser.email,
+                image: req.authUser.image,
+                phone: req.authUser.phone,
+                role: req.authUser.role,
+            },
+        });
+    } catch (error) {
+        console.error("Fetch profile error:", error);
 
-    return res.status(500).json({
-      success: false,
-      message: "Failed to fetch profile",
-    });
-  }
+        return res.status(500).json({
+            success: false,
+            message: "Failed to fetch profile",
+        });
+    }
 });
 
 
 app.patch("/users/me", verifyCustomer, async (req, res) => {
-  try {
-    const { name, phone, image } = req.body;
+    try {
+        const { name, phone, image } = req.body;
 
-    const updates = {};
+        const updates = {};
 
-    if (name !== undefined) {
-      if (
-        typeof name !== "string" ||
-        name.trim().length < 2 ||
-        name.trim().length > 60
-      ) {
-        return res.status(400).json({
-          success: false,
-          message: "Name must contain 2-60 characters",
-        });
-      }
+        if (name !== undefined) {
+            if (
+                typeof name !== "string" ||
+                name.trim().length < 2 ||
+                name.trim().length > 60
+            ) {
+                return res.status(400).json({
+                    success: false,
+                    message: "Name must contain 2-60 characters",
+                });
+            }
 
-      updates.name = name.trim();
-    }
-
-    if (phone !== undefined) {
-      if (typeof phone !== "string" || phone.length > 25) {
-        return res.status(400).json({
-          success: false,
-          message: "Invalid phone number",
-        });
-      }
-
-      const cleanPhone = phone.trim();
-
-      if (
-        cleanPhone &&
-        !/^[+()\d\s-]{7,20}$/.test(cleanPhone)
-      ) {
-        return res.status(400).json({
-          success: false,
-          message: "Please provide a valid phone number",
-        });
-      }
-
-      updates.phone = cleanPhone;
-    }
-
-    if (image !== undefined) {
-      if (typeof image !== "string" || image.length > 2048) {
-        return res.status(400).json({
-          success: false,
-          message: "Invalid profile image",
-        });
-      }
-
-      if (image !== "") {
-        try {
-          const imageUrl = new URL(image);
-
-          if (
-            imageUrl.protocol !== "https:" ||
-            !["i.ibb.co", "ibb.co"].includes(imageUrl.hostname)
-          ) {
-            return res.status(400).json({
-              success: false,
-              message: "Invalid profile image URL",
-            });
-          }
-        } catch {
-          return res.status(400).json({
-            success: false,
-            message: "Invalid profile image URL",
-          });
+            updates.name = name.trim();
         }
-      }
 
-      updates.image = image;
+        if (phone !== undefined) {
+            if (typeof phone !== "string" || phone.length > 25) {
+                return res.status(400).json({
+                    success: false,
+                    message: "Invalid phone number",
+                });
+            }
+
+            const cleanPhone = phone.trim();
+
+            if (
+                cleanPhone &&
+                !/^[+()\d\s-]{7,20}$/.test(cleanPhone)
+            ) {
+                return res.status(400).json({
+                    success: false,
+                    message: "Please provide a valid phone number",
+                });
+            }
+
+            updates.phone = cleanPhone;
+        }
+
+        if (image !== undefined) {
+            if (typeof image !== "string" || image.length > 2048) {
+                return res.status(400).json({
+                    success: false,
+                    message: "Invalid profile image",
+                });
+            }
+
+            if (image !== "") {
+                try {
+                    const imageUrl = new URL(image);
+
+                    if (
+                        imageUrl.protocol !== "https:" ||
+                        !["i.ibb.co", "ibb.co"].includes(imageUrl.hostname)
+                    ) {
+                        return res.status(400).json({
+                            success: false,
+                            message: "Invalid profile image URL",
+                        });
+                    }
+                } catch {
+                    return res.status(400).json({
+                        success: false,
+                        message: "Invalid profile image URL",
+                    });
+                }
+            }
+
+            updates.image = image;
+        }
+
+        if (Object.keys(updates).length === 0) {
+            return res.status(400).json({
+                success: false,
+                message: "No profile information provided",
+            });
+        }
+
+        const userFilter = req.authUser.mongoId !== undefined
+            ? { _id: req.authUser.mongoId }
+            : { id: req.authUser.id };
+
+        const result = await users.updateOne(
+            userFilter,
+            {
+                $set: {
+                    ...updates,
+                    updatedAt: new Date(),
+                },
+            }
+        );
+
+        if (result.matchedCount === 0) {
+            return res.status(404).json({
+                success: false,
+                message: "User not found",
+            });
+        }
+
+        return res.status(200).json({
+            success: true,
+            message: "Profile updated successfully",
+            user: {
+                id: req.authUser.id,
+                name: updates.name ?? req.authUser.name,
+                email: req.authUser.email,
+                phone: updates.phone ?? req.authUser.phone,
+                image: updates.image ?? req.authUser.image,
+            },
+        });
+    } catch (error) {
+        console.error("Update profile error:", error);
+
+        return res.status(500).json({
+            success: false,
+            message: "Failed to update profile",
+        });
     }
-
-    if (Object.keys(updates).length === 0) {
-      return res.status(400).json({
-        success: false,
-        message: "No profile information provided",
-      });
-    }
-
-    const userFilter = req.authUser.mongoId !== undefined
-      ? { _id: req.authUser.mongoId }
-      : { id: req.authUser.id };
-
-    const result = await users.updateOne(
-      userFilter,
-      {
-        $set: {
-          ...updates,
-          updatedAt: new Date(),
-        },
-      }
-    );
-
-    if (result.matchedCount === 0) {
-      return res.status(404).json({
-        success: false,
-        message: "User not found",
-      });
-    }
-
-    return res.status(200).json({
-      success: true,
-      message: "Profile updated successfully",
-      user: {
-        id: req.authUser.id,
-        name: updates.name ?? req.authUser.name,
-        email: req.authUser.email,
-        phone: updates.phone ?? req.authUser.phone,
-        image: updates.image ?? req.authUser.image,
-      },
-    });
-  } catch (error) {
-    console.error("Update profile error:", error);
-
-    return res.status(500).json({
-      success: false,
-      message: "Failed to update profile",
-    });
-  }
 });
 
 
@@ -882,7 +1438,6 @@ app.get('/services/:id', async (req, res) => {
         res.status(500).send({ message: 'Failed to fetch service' });
     }
 });
-
 
 
 app.get("/admin/services", verifyAdmin, async (req, res) => {
@@ -1398,7 +1953,6 @@ app.delete("/admin/services/:id", verifyAdmin, async (req, res) => {
         });
     }
 });
-
 
 
 
@@ -2272,6 +2826,624 @@ app.patch("/admin/profile", verifyAdmin, async (req, res) => {
         return res.status(500).json({
             success: false,
             message: "Failed to update admin profile",
+        });
+    }
+});
+
+
+app.post("/appointments/:id/create-checkout-session", verifyCustomer,
+    async (req, res) => {
+        try {
+            const { id } = req.params;
+
+            if (!ObjectId.isValid(id)) {
+                return res.status(400).json({
+                    success: false,
+                    message: "Invalid appointment ID",
+                });
+            }
+
+            const configuredFrontendUrl = process.env.FRONTEND_URL?.trim();
+
+            if (!configuredFrontendUrl) {
+                return res.status(500).json({
+                    success: false,
+                    message: "Frontend URL is not configured",
+                });
+            }
+
+            const frontendUrl = configuredFrontendUrl.replace(/\/+$/, "");
+
+            try {
+                const parsedUrl = new URL(frontendUrl);
+
+                if (!["http:", "https:"].includes(parsedUrl.protocol)) {
+                    throw new Error("Invalid protocol");
+                }
+            } catch {
+                return res.status(500).json({
+                    success: false,
+                    message: "Invalid frontend URL configuration",
+                });
+            }
+
+            const appointmentId = new ObjectId(id);
+            const customerId = req.authUser.id;
+
+            const appointment = await appointments.findOne({
+                _id: appointmentId,
+                customerId,
+            });
+
+            if (!appointment) {
+                return res.status(404).json({
+                    success: false,
+                    message: "Appointment not found",
+                });
+            }
+
+            if (
+                String(appointment.status).toLowerCase() !== "confirmed"
+            ) {
+                return res.status(409).json({
+                    success: false,
+                    message: "Only confirmed appointments can be paid",
+                });
+            }
+
+            if (
+                String(appointment.paymentStatus).toLowerCase() !== "unpaid"
+            ) {
+                return res.status(409).json({
+                    success: false,
+                    message: "This appointment is not eligible for payment",
+                });
+            }
+
+            const serviceId = appointment.serviceId;
+
+            if (!ObjectId.isValid(serviceId)) {
+                return res.status(400).json({
+                    success: false,
+                    message: "Invalid service reference",
+                });
+            }
+
+            const service = await salonbook.findOne({
+                _id: new ObjectId(serviceId),
+            });
+
+            if (!service) {
+                return res.status(404).json({
+                    success: false,
+                    message: "Associated service not found",
+                });
+            }
+
+            const amount = Number(appointment.servicePrice);
+
+            if (!Number.isFinite(amount) || amount <= 0) {
+                return res.status(400).json({
+                    success: false,
+                    message: "Invalid appointment payment amount",
+                });
+            }
+
+            const amountInMinorUnit = Math.round(amount * 100);
+
+            if (
+                !Number.isSafeInteger(amountInMinorUnit) ||
+                amountInMinorUnit <= 0
+            ) {
+                return res.status(400).json({
+                    success: false,
+                    message: "Invalid payment amount",
+                });
+            }
+
+            const currency = (
+                process.env.STRIPE_CURRENCY || "bdt"
+            ).toLowerCase();
+
+            const appointmentIdString = appointmentId.toString();
+
+            const successUrl = `${frontendUrl}/payment/success?session_id={CHECKOUT_SESSION_ID}`;
+
+            const cancelUrl = `${frontendUrl}/payment/cancel`;
+
+            const existingTransaction = await transactions.findOne({
+                appointmentId: appointmentIdString,
+                customerId,
+                status: "pending",
+            });
+
+            if (existingTransaction?.stripeSessionId) {
+                const existingSession =
+                    await stripe.checkout.sessions.retrieve(
+                        existingTransaction.stripeSessionId
+                    );
+
+                if (
+                    existingSession.status === "open" &&
+                    existingSession.url &&
+                    existingSession.success_url === successUrl &&
+                    existingSession.cancel_url === cancelUrl
+                ) {
+                    return res.status(200).json({
+                        success: true,
+                        message: "Existing checkout session retrieved",
+                        checkoutUrl: existingSession.url,
+                        sessionId: existingSession.id,
+                    });
+                }
+
+                if (existingSession.status === "complete") {
+                    return res.status(409).json({
+                        success: false,
+                        message: "Payment is being processed. Please wait for confirmation.",
+                    });
+                }
+
+                if (existingSession.status === "open") {
+                    await stripe.checkout.sessions.expire(
+                        existingSession.id
+                    );
+                }
+
+                await transactions.updateOne(
+                    {
+                        _id: existingTransaction._id,
+                        status: "pending",
+                    },
+                    {
+                        $set: {
+                            status: "expired",
+                            updatedAt: new Date(),
+                        },
+                    }
+                );
+            }
+
+            const metadata = {
+                appointmentId: appointmentIdString,
+                customerId,
+                serviceId: String(serviceId),
+            };
+
+            const session = await stripe.checkout.sessions.create({
+                mode: "payment",
+
+                line_items: [
+                    {
+                        price_data: {
+                            currency,
+                            product_data: {
+                                name: service.serviceName,
+                                description: `Appointment on ${appointment.appointmentDate} at ${appointment.timeSlot}`,
+                            },
+                            unit_amount: amountInMinorUnit,
+                        },
+                        quantity: 1,
+                    },
+                ],
+
+                ...(req.authUser.email
+                    ? {
+                        customer_email: req.authUser.email,
+                    }
+                    : {}),
+
+                client_reference_id: appointmentIdString,
+
+                metadata,
+
+                payment_intent_data: {
+                    metadata,
+                },
+
+                success_url: successUrl,
+
+                cancel_url: cancelUrl,
+            });
+
+            if (!session.url) {
+                return res.status(500).json({
+                    success: false,
+                    message: "Failed to generate checkout URL",
+                });
+            }
+
+            const transaction = {
+                appointmentId: appointmentIdString,
+                customerId,
+
+                customerName: req.authUser.name || "",
+                customerEmail: req.authUser.email || "",
+
+                serviceId: String(serviceId),
+                serviceName: service.serviceName,
+
+                appointmentDate: appointment.appointmentDate,
+                timeSlot: appointment.timeSlot,
+
+                amount,
+                currency,
+
+                stripeSessionId: session.id,
+                stripePaymentIntentId: null,
+
+                status: "pending",
+                paymentStatus: "unpaid",
+
+                createdAt: new Date(),
+                updatedAt: new Date(),
+                paidAt: null,
+            };
+
+            try {
+                await transactions.insertOne(transaction);
+            } catch (dbError) {
+                await stripe.checkout.sessions.expire(session.id)
+                    .catch((expireError) => {
+                        console.error(
+                            "Checkout expiration error:",
+                            expireError.message
+                        );
+                    });
+
+                throw dbError;
+            }
+
+            return res.status(201).json({
+                success: true,
+                message: "Checkout session created successfully",
+                checkoutUrl: session.url,
+                sessionId: session.id,
+            });
+
+        } catch (error) {
+            console.error(
+                "Create checkout session error:",
+                error
+            );
+
+            return res.status(500).json({
+                success: false,
+                message: "Failed to create checkout session",
+            });
+        }
+    }
+);
+
+
+app.post("/payments/checkout-verify", verifyCustomer, async (req, res) => {
+    try {
+        const { sessionId } = req.body || {};
+
+        if (
+            typeof sessionId !== "string" ||
+            !sessionId.startsWith("cs_") ||
+            sessionId.length > 255
+        ) {
+            return res.status(400).json({
+                success: false,
+                message: "A valid Stripe session ID is required",
+            });
+        }
+
+        const session = await stripe.checkout.sessions.retrieve(sessionId);
+
+        if (
+            session.mode !== "payment" ||
+            session.status !== "complete" ||
+            session.payment_status !== "paid"
+        ) {
+            return res.status(400).json({
+                success: false,
+                message: "Payment has not been completed",
+            });
+        }
+
+        const metadata = session.metadata || {};
+        const customerId = req.authUser.id;
+        const appointmentId = metadata.appointmentId;
+        const serviceId = metadata.serviceId;
+
+        if (
+            metadata.customerId !== customerId ||
+            !ObjectId.isValid(appointmentId) ||
+            session.client_reference_id !== appointmentId
+        ) {
+            return res.status(403).json({
+                success: false,
+                message: "This payment session does not belong to your account",
+            });
+        }
+
+        const transaction = await transactions.findOne({
+            stripeSessionId: session.id,
+            appointmentId,
+            customerId,
+        });
+
+        if (!transaction) {
+            return res.status(404).json({
+                success: false,
+                message: "Payment transaction not found",
+            });
+        }
+
+        if (
+            transaction.serviceId !== serviceId ||
+            !["pending", "paid"].includes(transaction.status)
+        ) {
+            return res.status(409).json({
+                success: false,
+                message: "This transaction is not eligible for verification",
+            });
+        }
+
+        const appointmentObjectId = new ObjectId(appointmentId);
+
+        const appointment = await appointments.findOne({
+            _id: appointmentObjectId,
+            customerId,
+        });
+
+        if (!appointment) {
+            return res.status(404).json({
+                success: false,
+                message: "Appointment not found",
+            });
+        }
+
+        if (appointment.serviceId !== transaction.serviceId) {
+            return res.status(409).json({
+                success: false,
+                message: "Appointment and transaction details do not match",
+            });
+        }
+
+        const expectedAmount = Math.round(
+            Number(transaction.amount) * 100
+        );
+
+        const expectedCurrency = String(
+            transaction.currency || ""
+        ).toLowerCase();
+
+        if (
+            !Number.isSafeInteger(expectedAmount) ||
+            expectedAmount <= 0 ||
+            session.amount_total !== expectedAmount ||
+            session.currency !== expectedCurrency
+        ) {
+            return res.status(400).json({
+                success: false,
+                message: "Stripe payment amount or currency does not match the transaction",
+            });
+        }
+
+        const paymentIntentId =
+            typeof session.payment_intent === "string"
+                ? session.payment_intent
+                : session.payment_intent?.id || null;
+
+        const paidAt = transaction.paidAt || new Date();
+
+        if (transaction.status !== "paid") {
+            await transactions.updateOne(
+                {
+                    _id: transaction._id,
+                    status: "pending",
+                },
+                {
+                    $set: {
+                        status: "paid",
+                        paymentStatus: "paid",
+                        stripePaymentIntentId: paymentIntentId,
+                        stripePaymentStatus: session.payment_status,
+                        paidAt,
+                        updatedAt: new Date(),
+                    },
+                }
+            );
+        }
+
+        await appointments.updateOne(
+            {
+                _id: appointmentObjectId,
+                customerId,
+                paymentStatus: { $ne: "paid" },
+            },
+            {
+                $set: {
+                    paymentStatus: "paid",
+                    stripePaymentIntentId: paymentIntentId,
+                    paidAt,
+                    updatedAt: new Date(),
+                },
+            }
+        );
+
+        const [updatedTransaction, updatedAppointment] =
+            await Promise.all([
+                transactions.findOne({
+                    _id: transaction._id,
+                }),
+
+                appointments.findOne({
+                    _id: appointmentObjectId,
+                    customerId,
+                }),
+            ]);
+
+        if (
+            updatedTransaction?.status !== "paid" ||
+            updatedTransaction?.paymentStatus !== "paid" ||
+            updatedAppointment?.paymentStatus !== "paid"
+        ) {
+            return res.status(500).json({
+                success: false,
+                message: "Payment was received, but the database update could not be completed. Please retry verification.",
+            });
+        }
+
+        return res.status(200).json({
+            success: true,
+            message: "Payment verified successfully",
+
+            transaction: {
+                id: updatedTransaction._id.toString(),
+                appointmentId: updatedTransaction.appointmentId,
+                amount: updatedTransaction.amount,
+                currency: updatedTransaction.currency,
+                status: updatedTransaction.status,
+                paymentStatus: updatedTransaction.paymentStatus,
+                paidAt: updatedTransaction.paidAt,
+            },
+
+            appointment: {
+                id: updatedAppointment._id.toString(),
+                paymentStatus: updatedAppointment.paymentStatus,
+            },
+        });
+
+    } catch (error) {
+        console.error("Checkout verification error:", error);
+
+        return res.status(500).json({
+            success: false,
+            message: "Failed to verify payment",
+        });
+    }
+});
+
+
+// transctions related api
+
+
+app.get("/admin/transactions", verifyAdmin, async (req, res) => {
+    try {
+        const allTransactions = await transactions
+            .find({})
+            .sort({ createdAt: -1 })
+            .toArray();
+
+        const formattedTransactions = await Promise.all(
+            allTransactions.map(async (transaction) => {
+                const customerId = String(transaction.customerId || "");
+                const appointmentId = String(transaction.appointmentId || "");
+                const serviceId = String(transaction.serviceId || "");
+
+                const customerFilters = customerId
+                    ? [
+                        { _id: customerId },
+                        { id: customerId },
+                    ]
+                    : [];
+
+                if (ObjectId.isValid(customerId)) {
+                    customerFilters.push({
+                        _id: new ObjectId(customerId),
+                    });
+                }
+
+                const [customer, appointment, service] = await Promise.all([
+                    customerFilters.length
+                        ? users.findOne(
+                            { $or: customerFilters },
+                            {
+                                projection: {
+                                    name: 1,
+                                    email: 1,
+                                },
+                            }
+                        )
+                        : null,
+
+                    ObjectId.isValid(appointmentId)
+                        ? appointments.findOne({
+                            _id: new ObjectId(appointmentId),
+                        })
+                        : null,
+
+                    ObjectId.isValid(serviceId)
+                        ? salonbook.findOne({
+                            _id: new ObjectId(serviceId),
+                        })
+                        : null,
+                ]);
+
+                return {
+                    _id: transaction._id.toString(),
+
+                    customerName:
+                        transaction.customerName ||
+                        customer?.name ||
+                        "Unknown Customer",
+
+                    customerEmail:
+                        transaction.customerEmail ||
+                        customer?.email ||
+                        "",
+
+                    serviceName:
+                        transaction.serviceName ||
+                        service?.serviceName ||
+                        "Unknown Service",
+
+                    appointmentDate:
+                        transaction.appointmentDate ||
+                        appointment?.appointmentDate ||
+                        null,
+
+                    timeSlot:
+                        transaction.timeSlot ||
+                        appointment?.timeSlot ||
+                        "",
+
+                    amount: Number(transaction.amount || 0),
+
+                    currency: String(
+                        transaction.currency || "bdt"
+                    ).toLowerCase(),
+
+                    stripeSessionId:
+                        transaction.stripeSessionId || "",
+
+                    paymentStatus:
+                        transaction.paymentStatus ||
+                        (transaction.status === "paid"
+                            ? "paid"
+                            : transaction.status === "failed"
+                                ? "failed"
+                                : "unpaid"),
+
+                    transactionStatus:
+                        transaction.status || "pending",
+
+                    transactionDate:
+                        transaction.createdAt ||
+                        transaction.payment_date ||
+                        transaction.paidAt ||
+                        null,
+                };
+            })
+        );
+
+        return res.status(200).json({
+            success: true,
+            count: formattedTransactions.length,
+            transactions: formattedTransactions,
+        });
+
+    } catch (error) {
+        console.error("Admin transactions fetch error:", error);
+
+        return res.status(500).json({
+            success: false,
+            message: "Failed to fetch transactions",
         });
     }
 });
